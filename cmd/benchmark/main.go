@@ -11,22 +11,34 @@ import (
 )
 
 const (
-	Addr     = "127.0.0.1:11211"
-	TotalOps = 1000000 // 100к записей
-	Workers  = 500     // 50 параллельных соединений
-	Value    = "bench-value-payload"
+	ColorReset  = "\033[0m"
+	ColorCyan   = "\033[36m"
+	ColorGreen  = "\033[32m"
+	ColorYellow = "\033[33m"
+	ColorRed    = "\033[31m"
+	ColorBlue   = "\033[34m"
+	ColorBold   = "\033[1m"
+)
+
+const (
+	Addr      = "127.0.0.1:11211"
+	TotalOps  = 1000000
+	Workers   = 500
+	DataValue = "bench-value-payload"
 )
 
 func main() {
-	fmt.Printf("🚀 Запуск комплексного бенчмарка (%s)\n", Addr)
+	printHeader()
 
-	// --- ФАЗА 1: SET ---
-	fmt.Printf("\n🔹 Фаза 1: Запись (SET) %d ключей...\n", TotalOps)
+	// --- PHASE 1: SET (Write) ---
+	fmt.Printf("%s%s🔹 Phase 1: Heavy Write (SET) %d keys...%s\n", ColorBold, ColorCyan, TotalOps, ColorReset)
 	runTest(true)
 
-	// --- ФАЗА 2: GET ---
-	fmt.Printf("\n🔹 Фаза 2: Чтение и проверка (GET) %d ключей...\n", TotalOps)
+	// --- PHASE 2: GET (Read) ---
+	fmt.Printf("\n%s%s🔹 Phase 2: Integrity Check (GET) %d keys...%s\n", ColorBold, ColorCyan, TotalOps, ColorReset)
 	runTest(false)
+
+	fmt.Printf("\n%s%s✨ Benchmark Session Completed!%s\n", ColorBold, ColorGreen, ColorReset)
 }
 
 func runTest(isSet bool) {
@@ -37,11 +49,22 @@ func runTest(isSet bool) {
 
 	for i := 0; i < Workers; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(id int) {
 			defer wg.Done()
 
-			conn, err := net.Dial("tcp", Addr)
+			// RETRY LOGIC for stable connection under high OS pressure
+			var conn net.Conn
+			var err error
+			for retries := 0; retries < 30; retries++ {
+				conn, err = net.Dial("tcp", Addr)
+				if err == nil {
+					break
+				}
+				time.Sleep(30 * time.Millisecond)
+			}
+
 			if err != nil {
+				atomic.AddInt64(&errors, 1)
 				return
 			}
 			defer conn.Close()
@@ -58,41 +81,32 @@ func runTest(isSet bool) {
 				key := fmt.Sprintf("key-%d", current)
 
 				if isSet {
-					// Команда SET
-					fmt.Fprintf(writer, "set %s 0 0 %d\r\n%s\r\n", key, len(Value), Value)
+					fmt.Fprintf(writer, "set %s 0 0 %d\r\n%s\r\n", key, len(DataValue), DataValue)
 					writer.Flush()
 
-					// Ждем STORED\r\n
 					resp, _ := reader.ReadString('\n')
 					if !strings.Contains(resp, "STORED") {
 						atomic.AddInt64(&errors, 1)
 					}
 				} else {
-					// Команда GET
 					fmt.Fprintf(writer, "get %s\r\n", key)
 					writer.Flush()
 
-					// Читаем VALUE <key> <flags> <bytes>\r\n
 					resp, _ := reader.ReadString('\n')
 					if strings.Contains(resp, "VALUE") {
-						// Читаем саму строку данных
 						data, _ := reader.ReadString('\n')
-						data = strings.TrimSpace(data)
-
-						// Читаем финальный END\r\n
 						reader.ReadString('\n')
-
-						if data != Value {
+						if strings.TrimSpace(data) != DataValue {
 							atomic.AddInt64(&errors, 1)
 						}
 					} else {
-						// Ключ не найден (END)
 						atomic.AddInt64(&errors, 1)
 					}
 				}
 
-				if current%100000 == 0 {
-					fmt.Printf("   ... обработано %d\n", current)
+				if current%500000 == 0 {
+					fmt.Printf("   %sProgress:%s %d / %d ops (%d%%)\n",
+						ColorYellow, ColorReset, current, TotalOps, (current*100)/TotalOps)
 				}
 			}
 		}(i)
@@ -100,13 +114,28 @@ func runTest(isSet bool) {
 
 	wg.Wait()
 	duration := time.Since(start)
+	opsPerSec := float64(TotalOps) / duration.Seconds()
 
-	mode := "SET"
+	mode := "WRITE (SET)"
 	if !isSet {
-		mode = "GET"
+		mode = "READ (GET)"
 	}
 
-	fmt.Printf("🏁 Результаты %s:\n", mode)
-	fmt.Printf("   Время: %v | Скорость: %.0f ops/sec | Ошибок: %d\n",
-		duration, float64(TotalOps)/duration.Seconds(), errors)
+	fmt.Printf("\n%s🏁 %s RESULTS:%s\n", ColorBold, mode, ColorReset)
+	fmt.Printf("   %s⏱  Time:%s     %v\n", ColorBlue, ColorReset, duration)
+	fmt.Printf("   %s🚀 Speed:%s    %s%.0f ops/sec%s\n", ColorBlue, ColorReset, ColorGreen, opsPerSec, ColorReset)
+
+	errColor := ColorGreen
+	if errors > 0 {
+		errColor = ColorRed
+	}
+	fmt.Printf("   %s❌ Errors:%s   %s%d%s\n", ColorBlue, ColorReset, errColor, errors, ColorReset)
+}
+
+func printHeader() {
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("%s%s  LSM-TREE ENGINE HIGH-LOAD BENCHMARK%s\n", ColorBold, ColorYellow, ColorReset)
+	fmt.Printf("  Target: %s%s%s | Workers: %s%d%s\n",
+		ColorCyan, Addr, ColorReset, ColorCyan, Workers, ColorReset)
+	fmt.Println(strings.Repeat("=", 60))
 }
