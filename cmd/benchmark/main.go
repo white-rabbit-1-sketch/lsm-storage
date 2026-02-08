@@ -22,8 +22,8 @@ const (
 
 const (
 	Addr      = "127.0.0.1:11211"
-	TotalOps  = 1000000
-	Workers   = 500
+	TotalOps  = 3000000
+	Workers   = 800
 	DataValue = "bench-value-payload"
 )
 

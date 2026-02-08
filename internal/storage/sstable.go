@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"io"
 	"os"
@@ -9,11 +10,13 @@ import (
 )
 
 type SSTable struct {
-	f                *os.File
-	writer           *bufio.Writer
-	index            []IndexEntry
-	indexStartOffset int64
-	blockSize        int64
+	f                      *os.File
+	writer                 *bufio.Writer
+	index                  []IndexEntry
+	indexStartOffset       int64
+	bloomFilterStartOffset int64
+	blockSize              int64
+	filter                 BloomFilter
 }
 
 type IndexEntry struct {
@@ -58,6 +61,17 @@ func OpenSSTable(path string, blockSize int64) (*SSTable, error) {
 	}
 
 	t := &SSTable{f: f, blockSize: blockSize}
+
+	err = t.readBloomFilter()
+	if err != nil {
+		closeError := f.Close()
+		if closeError != nil {
+			return nil, err
+		}
+
+		return nil, err
+	}
+
 	err = t.readIndex()
 	if err != nil {
 		closeError := f.Close()
@@ -76,6 +90,10 @@ func (t *SSTable) Close() error {
 }
 
 func (t *SSTable) Get(searchKey string) ([]byte, uint32, bool, error) {
+	if !t.filter.Contains([]byte(searchKey)) {
+		return nil, 0, false, nil
+	}
+
 	if len(t.index) == 0 {
 		return nil, 0, false, nil
 	}
@@ -84,64 +102,86 @@ func (t *SSTable) Get(searchKey string) ([]byte, uint32, bool, error) {
 		return t.index[i].Key > searchKey
 	})
 
-	if i == 0 && t.index[0].Key > searchKey {
-		return nil, 0, false, nil
-	}
-
-	targetIndexEntryPosition := 0
+	targetIdx := 0
 	if i > 0 {
-		targetIndexEntryPosition = i - 1
+		targetIdx = i - 1
 	}
 
-	currOffset := t.index[targetIndexEntryPosition].Offset
-	for {
-		if currOffset >= t.indexStartOffset {
+	startOffset := t.index[targetIdx].Offset
+	var endOffset int64
+	if targetIdx+1 < len(t.index) {
+		endOffset = t.index[targetIdx+1].Offset
+	} else {
+		endOffset = t.bloomFilterStartOffset
+	}
+
+	blockLen := endOffset - startOffset
+	blockBuf := make([]byte, blockLen)
+	_, err := t.f.ReadAt(blockBuf, startOffset)
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	var pos int64 = 0
+	searchKeyBytes := []byte(searchKey)
+
+	for pos < blockLen {
+		kLen := binary.BigEndian.Uint16(blockBuf[pos : pos+2])
+		vLen := binary.BigEndian.Uint32(blockBuf[pos+2 : pos+6])
+		flags := binary.BigEndian.Uint32(blockBuf[pos+6 : pos+10])
+		isTombstone := binary.BigEndian.Uint16(blockBuf[pos+10:pos+12]) == 1
+		pos += 12
+
+		key := blockBuf[pos : pos+int64(kLen)]
+		pos += int64(kLen)
+
+		res := bytes.Compare(key, searchKeyBytes)
+		if res == 0 {
+			val := make([]byte, vLen)
+			copy(val, blockBuf[pos:pos+int64(vLen)])
+			return val, flags, isTombstone, nil
+		}
+
+		if res > 0 {
 			break
 		}
 
-		var header [12]byte
-		_, err := t.f.ReadAt(header[:], currOffset)
-		if err != nil {
-			return nil, 0, false, err
-		}
-
-		kLen := binary.BigEndian.Uint16(header[0:2])
-		vLen := binary.BigEndian.Uint32(header[2:6])
-		flags := binary.BigEndian.Uint32(header[6:10])
-		isTombstoneVal := binary.BigEndian.Uint16(header[10:12])
-		isTombstone := false
-		if isTombstoneVal == 1 {
-			isTombstone = true
-		}
-
-		currOffset += 12
-
-		keyBuf := make([]byte, kLen)
-		_, err = t.f.ReadAt(keyBuf, currOffset)
-		if err != nil {
-			return nil, 0, false, err
-		}
-		currOffset += int64(kLen)
-
-		currentKey := string(keyBuf)
-		if currentKey == searchKey {
-			valBuf := make([]byte, vLen)
-			_, err = t.f.ReadAt(valBuf, currOffset)
-			if err != nil {
-				return nil, 0, false, err
-			}
-
-			return valBuf, flags, isTombstone, nil
-		}
-
-		if currentKey > searchKey {
-			break
-		}
-
-		currOffset += int64(vLen)
+		pos += int64(vLen)
 	}
 
 	return nil, 0, false, nil
+}
+
+func (t *SSTable) readBloomFilter() error {
+	_, err := t.f.Seek(-16, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+
+	err = binary.Read(t.f, binary.BigEndian, &t.bloomFilterStartOffset)
+	if err != nil {
+		return err
+	}
+
+	_, err = t.f.Seek(t.bloomFilterStartOffset, io.SeekStart)
+	if err != nil {
+		return err
+	}
+
+	var filterLen uint32
+	err = binary.Read(t.f, binary.BigEndian, &filterLen)
+	if err != nil {
+		return err
+	}
+
+	filterBuf := make([]byte, filterLen)
+	_, err = io.ReadFull(t.f, filterBuf)
+	if err != nil {
+		return err
+	}
+	t.filter = BloomFilter(filterBuf)
+
+	return nil
 }
 
 func (t *SSTable) readIndex() error {
@@ -169,7 +209,7 @@ func (t *SSTable) readIndex() error {
 
 	for {
 		curr, _ := t.f.Seek(0, io.SeekCurrent)
-		if curr >= info.Size()-8 {
+		if curr >= info.Size()-16 {
 			break
 		}
 
@@ -201,6 +241,7 @@ func (t *SSTable) Write(skipList *SkipList) error {
 	var lastIndexEntryOffset int64 = 0
 
 	t.index = make([]IndexEntry, 0, skipList.size/t.blockSize)
+	t.filter = NewBloomFilter(int(skipList.size/64), 0.01)
 
 	curr := skipList.head.next[0]
 	var offset int64
@@ -221,12 +262,20 @@ func (t *SSTable) Write(skipList *SkipList) error {
 
 		offset += size
 
+		t.filter.Add([]byte(curr.key))
+
 		curr = curr.next[0]
 	}
 
-	t.indexStartOffset = offset
+	t.bloomFilterStartOffset = offset
+	err := t.writeBloomFilter()
+	if err != nil {
+		return err
+	}
 
-	err := t.writeIndex()
+	filterSize := int64(4 + len([]byte(t.filter)))
+	t.indexStartOffset = t.bloomFilterStartOffset + filterSize
+	err = t.writeIndex()
 	if err != nil {
 		return err
 	}
@@ -284,6 +333,20 @@ func (t *SSTable) writeEntry(key string, value []byte, flags uint32, isTombstone
 	return size, nil
 }
 
+func (t *SSTable) writeBloomFilter() error {
+	filterData := []byte(t.filter)
+	err := binary.Write(t.writer, binary.BigEndian, uint32(len(filterData)))
+	if err != nil {
+		return err
+	}
+	_, err = t.writer.Write(filterData)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (t *SSTable) writeIndex() error {
 	for i := range t.index {
 		err := binary.Write(t.writer, binary.BigEndian, uint16(len(t.index[i].Key)))
@@ -302,7 +365,12 @@ func (t *SSTable) writeIndex() error {
 		}
 	}
 
-	err := binary.Write(t.writer, binary.BigEndian, t.indexStartOffset)
+	err := binary.Write(t.writer, binary.BigEndian, t.bloomFilterStartOffset)
+	if err != nil {
+		return err
+	}
+
+	err = binary.Write(t.writer, binary.BigEndian, t.indexStartOffset)
 	if err != nil {
 		return err
 	}

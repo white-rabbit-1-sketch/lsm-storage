@@ -15,14 +15,15 @@ const MaxConnections = 1000000
 const ShutdownTimeout = 30
 
 const SetBodyMaxAllowedSize = 5 * 1024 * 1024
-const SetMaxConcurrentRequests = 400
+const SetMaxConcurrentRequests = 800
 
 const DataDir = "./../../data/"
-const BlockSize = 1024 * 16
+const BlockSize = 1024 * 4
 const MaxMemSize = 1024 * 1024 * 64
+const ShardsCount = 32
 
 func main() {
-	storage, err := strg.NewStorage(DataDir, BlockSize, MaxMemSize)
+	storage, err := strg.NewStorage(DataDir, BlockSize, MaxMemSize, ShardsCount)
 	if err != nil {
 		panic(err)
 	}
