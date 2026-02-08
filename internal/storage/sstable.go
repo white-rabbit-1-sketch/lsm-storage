@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"hash/fnv"
 	"io"
 	"os"
 	"sort"
@@ -17,6 +18,7 @@ type SSTable struct {
 	bloomFilterStartOffset int64
 	blockSize              int64
 	filter                 BloomFilter
+	hashIndex              map[uint64]int64
 }
 
 type IndexEntry struct {
@@ -24,10 +26,10 @@ type IndexEntry struct {
 	Offset int64
 }
 
-func CreateSSTable(path string, blockSize int64, skipList *SkipList) error {
+func Flush(path string, blockSize int64, skipList *SkipList) (*SSTable, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	table := &SSTable{
@@ -40,18 +42,23 @@ func CreateSSTable(path string, blockSize int64, skipList *SkipList) error {
 	if err != nil {
 		closeError := table.Close()
 		if closeError != nil {
-			return err
+			return nil, err
 		}
 
-		return err
+		return nil, err
 	}
 
-	err = table.Close()
+	err = f.Close()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	table.f, err = os.OpenFile(path, os.O_RDONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	return table, nil
 }
 
 func OpenSSTable(path string, blockSize int64) (*SSTable, error) {
@@ -82,6 +89,16 @@ func OpenSSTable(path string, blockSize int64) (*SSTable, error) {
 		return nil, err
 	}
 
+	err = t.rebuildHashIndex()
+	if err != nil {
+		closeError := f.Close()
+		if closeError != nil {
+			return nil, err
+		}
+
+		return nil, err
+	}
+
 	return t, nil
 }
 
@@ -92,6 +109,18 @@ func (t *SSTable) Close() error {
 func (t *SSTable) Get(searchKey string) ([]byte, uint32, bool, error) {
 	if !t.filter.Contains([]byte(searchKey)) {
 		return nil, 0, false, nil
+	}
+
+	h, err := t.hashString(searchKey)
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	if offset, ok := t.hashIndex[h]; ok {
+		val, flags, isTombstone, err := t.readEntryAt(offset, searchKey)
+		if err == nil && val != nil {
+			return val, flags, isTombstone, nil
+		}
 	}
 
 	if len(t.index) == 0 {
@@ -117,7 +146,7 @@ func (t *SSTable) Get(searchKey string) ([]byte, uint32, bool, error) {
 
 	blockLen := endOffset - startOffset
 	blockBuf := make([]byte, blockLen)
-	_, err := t.f.ReadAt(blockBuf, startOffset)
+	_, err = t.f.ReadAt(blockBuf, startOffset)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -152,6 +181,45 @@ func (t *SSTable) Get(searchKey string) ([]byte, uint32, bool, error) {
 	return nil, 0, false, nil
 }
 
+func (t *SSTable) readEntryAt(offset int64, searchKey string) ([]byte, uint32, bool, error) {
+	header := make([]byte, 12)
+	_, err := t.f.ReadAt(header, offset)
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	kLen := binary.BigEndian.Uint16(header[0:2])
+	vLen := binary.BigEndian.Uint32(header[2:6])
+	flags := binary.BigEndian.Uint32(header[6:10])
+	isT := binary.BigEndian.Uint16(header[10:12]) == 1
+
+	data := make([]byte, int(kLen)+int(vLen))
+	_, err = t.f.ReadAt(data, offset+12)
+	if err != nil {
+		return nil, 0, false, err
+	}
+
+	key := string(data[:kLen])
+	if key != searchKey {
+		return nil, 0, false, nil
+	}
+
+	val := make([]byte, vLen)
+	copy(val, data[kLen:])
+
+	return val, flags, isT, nil
+}
+
+func (t *SSTable) hashString(s string) (uint64, error) {
+	h := fnv.New64a()
+	_, err := h.Write([]byte(s))
+	if err != nil {
+		return 0, err
+	}
+
+	return h.Sum64(), nil
+}
+
 func (t *SSTable) readBloomFilter() error {
 	_, err := t.f.Seek(-16, io.SeekEnd)
 	if err != nil {
@@ -180,6 +248,41 @@ func (t *SSTable) readBloomFilter() error {
 		return err
 	}
 	t.filter = BloomFilter(filterBuf)
+
+	return nil
+}
+
+func (t *SSTable) rebuildHashIndex() error {
+	t.hashIndex = make(map[uint64]int64)
+
+	var pos int64 = 0
+
+	for pos < t.bloomFilterStartOffset {
+		entryOffset := pos
+
+		header := make([]byte, 12)
+		_, err := t.f.ReadAt(header, pos)
+		if err != nil {
+			return err
+		}
+
+		kLen := binary.BigEndian.Uint16(header[0:2])
+		vLen := binary.BigEndian.Uint32(header[2:6])
+		keyBuf := make([]byte, kLen)
+		_, err = t.f.ReadAt(keyBuf, pos+12)
+		if err != nil {
+			return err
+		}
+
+		h, err := t.hashString(string(keyBuf))
+		if err != nil {
+			return err
+		}
+
+		t.hashIndex[h] = entryOffset
+
+		pos += 12 + int64(kLen) + int64(vLen)
+	}
 
 	return nil
 }
@@ -242,6 +345,7 @@ func (t *SSTable) Write(skipList *SkipList) error {
 
 	t.index = make([]IndexEntry, 0, skipList.size/t.blockSize)
 	t.filter = NewBloomFilter(int(skipList.size/64), 0.01)
+	t.hashIndex = make(map[uint64]int64, skipList.size)
 
 	curr := skipList.head.next[0]
 	var offset int64
@@ -254,6 +358,13 @@ func (t *SSTable) Write(skipList *SkipList) error {
 
 			lastIndexEntryOffset = offset
 		}
+
+		h, err := t.hashString(curr.key)
+		if err != nil {
+			return err
+		}
+
+		t.hashIndex[h] = offset
 
 		size, err := t.writeEntry(curr.key, curr.value, curr.flags, curr.isTombstone)
 		if err != nil {
