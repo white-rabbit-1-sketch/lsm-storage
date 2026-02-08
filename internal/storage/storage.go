@@ -67,7 +67,7 @@ func (s *Storage) getShard(key string) (*Shard, error) {
 }
 
 func (s *Storage) Close() error {
-	err := s.flush(false, true)
+	err := s.flush(false)
 	if err != nil {
 		return err
 	}
@@ -119,15 +119,6 @@ func (s *Storage) loadSSTable(path string) error {
 	return nil
 }
 
-func (s *Storage) appendSSTable(table *SSTable) error {
-	s.tablesMutex.Lock()
-	defer s.tablesMutex.Unlock()
-
-	s.tables = append(s.tables, table)
-
-	return nil
-}
-
 func (s *Storage) Set(key string, value []byte, flags uint32) error {
 	shard, err := s.getShard(key)
 	if err != nil {
@@ -140,11 +131,13 @@ func (s *Storage) Set(key string, value []byte, flags uint32) error {
 	newSize := shard.skipList.size
 	shard.mu.Unlock()
 
-	atomic.AddInt64(&s.shardsSize, newSize-oldSize)
+	shardsSize := atomic.AddInt64(&s.shardsSize, newSize-oldSize)
 
-	err = s.flush(true, false)
-	if err != nil {
-		return err
+	if shardsSize >= s.maxMemSize {
+		err = s.flush(true)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -202,46 +195,48 @@ func (s *Storage) Delete(key string) error {
 	return nil
 }
 
-func (s *Storage) flush(load bool, force bool) error {
-	s.flushMutex.Lock()
-	defer s.flushMutex.Unlock()
+func (s *Storage) flush(load bool) error {
+	lock := s.flushMutex.TryLock()
+	if lock {
+		defer s.flushMutex.Unlock()
 
-	shardsSize := atomic.LoadInt64(&s.shardsSize)
-	if (force && shardsSize > 0) || (s.shardsSize >= s.maxMemSize) {
-		log.Println("Starting data flush...")
+		shardsSize := atomic.LoadInt64(&s.shardsSize)
+		if shardsSize > 0 {
+			log.Println("Starting data flush...")
 
-		for i := 0; i < int(s.shardsCount); i++ {
-			s.shards[i].mu.Lock()
+			for i := 0; i < int(s.shardsCount); i++ {
+				s.shards[i].mu.Lock()
 
-			if s.shards[i].skipList.size == 0 {
-				s.shards[i].mu.Unlock()
-				continue
-			}
+				if s.shards[i].skipList.size == 0 {
+					s.shards[i].mu.Unlock()
+					continue
+				}
 
-			name := fmt.Sprintf("%d.%d.sst", i, time.Now().UnixNano())
-			path := filepath.Join(s.dataDir, name)
+				name := fmt.Sprintf("%d.%d.sst", i, time.Now().UnixNano())
+				path := filepath.Join(s.dataDir, name)
 
-			table, err := Flush(path, s.blockSize, s.shards[i].skipList)
-			if err != nil {
-				s.shards[i].mu.Unlock()
-				return err
-			}
-
-			atomic.AddInt64(&s.shardsSize, -s.shards[i].skipList.size)
-
-			s.shards[i].skipList = NewSkipList()
-			s.shards[i].mu.Unlock()
-
-			if load {
-				err = s.appendSSTable(table)
+				err := CreateSSTable(path, s.blockSize, s.shards[i].skipList)
 				if err != nil {
+					s.shards[i].mu.Unlock()
 					return err
 				}
+
+				atomic.AddInt64(&s.shardsSize, -s.shards[i].skipList.size)
+
+				s.shards[i].skipList = NewSkipList()
+				s.shards[i].mu.Unlock()
+
+				if load {
+					err = s.loadSSTable(path)
+					if err != nil {
+						return err
+					}
+				}
+
 			}
 
+			log.Println("Data flush is end")
 		}
-
-		log.Println("Data flush is end")
 	}
 
 	return nil
